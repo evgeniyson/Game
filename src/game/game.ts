@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { Renderer, IS_TOUCH } from '../render/renderer';
 import { World } from '../world/world';
 import { FX } from '../render/fx';
+import { GrassField } from '../render/grass';
 import { Input, type Action } from '../input/input';
 import { Player } from './player';
 import { Mob } from './mob';
@@ -95,6 +96,7 @@ export interface SaveData {
 export class Game implements ItemGame, EffectCtx {
   r: Renderer;
   world: World;
+  grass: GrassField;
   fx: FX & { shake(a: number): void };
   input: Input;
   player: Player;
@@ -137,6 +139,7 @@ export class Game implements ItemGame, EffectCtx {
     const fx = new FX(r.scene);
     fx.onShake = (a) => (r.shake = Math.max(r.shake, a));
     this.fx = fx;
+    this.grass = new GrassField(r.scene, this.world);
 
     if (save) {
       const p = save.player;
@@ -903,6 +906,13 @@ export class Game implements ItemGame, EffectCtx {
           got.push(`+${q} ${ITEMS[d.id].icon}`);
           this.onGather(d.id, q);
         }
+        if (hv.loot) {
+          const lvl = this.zoneLevel(h.pos.x, h.pos.z);
+          const n = 1 + (this.rng.chance(0.35) ? 1 : 0);
+          for (let i = 0; i < n; i++) this.spawnLoot(rollGear(randomGearId(this.rng, p.cls.id, lvl), lvl, Math.max(1, rollRarity(this.rng, 0.12)), this.rng), h.pos);
+          this.ui.log('Сундук открыт! Внутри что-то блестит…', '#ffd76a');
+          this.fx.burst(h.pos.clone().setY(h.pos.y + 0.8), 0xffd76a, 24, 3);
+        }
         if (got.length) this.ui.float(h.pos.clone().setY(h.pos.y + 1.6), got.join(' '), 'loot');
         this.world.harvest(h);
         this.gainXp(2 + Math.floor(p.level / 3));
@@ -1199,6 +1209,7 @@ export class Game implements ItemGame, EffectCtx {
     }
     this.visited.add(Math.floor(p.pos.x / 32) + ',' + Math.floor(p.pos.z / 32));
     const b = this.world.biomeAt(p.pos.x, p.pos.z);
+    this.r.setBiome(b);
     this.zoneName = BIOME_NAMES[b];
     this.zoneLevelNow = this.zoneLevel(p.pos.x, p.pos.z);
     this.nearStation = this.stations.find((s) => s.pos.distanceTo(p.pos) < 3.2) ?? null;
@@ -1218,6 +1229,7 @@ export class Game implements ItemGame, EffectCtx {
     }
 
     this.r.follow(p.pos, dt);
+    this.grass.update(dt, p.pos);
     this.syncVisuals(dt);
   }
 
@@ -1487,6 +1499,7 @@ export class Game implements ItemGame, EffectCtx {
   }
 
   dispose() {
+    this.grass.dispose();
     this.world.dispose();
   }
 

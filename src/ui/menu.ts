@@ -44,6 +44,7 @@ export class Menu {
     const c = this.r.camera;
     c.position.set(Math.sin(this.angle) * R, GROUND + 22, Math.cos(this.angle) * R);
     c.lookAt(0, GROUND + 2, 0);
+    this.r.focus.set(0, GROUND + 2, 0);
     this.r.sun.position.set(-18, GROUND + 40, 14);
     this.r.sun.target.position.set(0, GROUND, 0);
     if (this.prev) {

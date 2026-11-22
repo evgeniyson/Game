@@ -17,6 +17,7 @@ export class VoxelGrid {
   map = new Map<number, number>();
   set(x: number, y: number, z: number, color: number) {
     this.map.set(key(Math.round(x), Math.round(y), Math.round(z)), color);
+    return this;
   }
   del(x: number, y: number, z: number) {
     this.map.delete(key(x, y, z));
@@ -44,6 +45,61 @@ export class VoxelGrid {
           }
         }
     return this;
+  }
+
+  /** Отрезок толщиной r (r < 1 — в один воксель) */
+  line(a: [number, number, number], b: [number, number, number], r: number, color: number | ((x: number, y: number, z: number) => number | null)) {
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    const steps = Math.max(1, Math.ceil(len * 2));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = a[0] + (b[0] - a[0]) * t,
+        y = a[1] + (b[1] - a[1]) * t,
+        z = a[2] + (b[2] - a[2]) * t;
+      if (r < 1) {
+        const c = typeof color === 'function' ? color(Math.round(x), Math.round(y), Math.round(z)) : color;
+        if (c !== null) this.set(x, y, z, c);
+      } else this.sphere(x, y, z, r, r, r, color);
+    }
+    return this;
+  }
+
+  /** Вертикальный цилиндр */
+  cyl(cx: number, y0: number, cz: number, r: number, h: number, color: number | ((x: number, y: number, z: number) => number | null)) {
+    for (let y = y0; y < y0 + h; y++)
+      for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++)
+        for (let z = Math.floor(cz - r); z <= Math.ceil(cz + r); z++) {
+          if ((x - cx) ** 2 + (z - cz) ** 2 > r * r) continue;
+          const c = typeof color === 'function' ? color(x, y, z) : color;
+          if (c !== null) this.set(x, y, z, c);
+        }
+    return this;
+  }
+
+  get size() {
+    return this.map.size;
+  }
+
+  forEach(fn: (x: number, y: number, z: number, c: number) => void) {
+    for (const [k, c] of this.map) fn((k & 1023) - 512, ((k >>> 10) & 1023) - 512, ((k >>> 20) & 1023) - 512, c);
+  }
+
+  /** Грубая версия модели для дальнего LOD */
+  downsample(k: number): VoxelGrid {
+    const g = new VoxelGrid();
+    const cnt = new Map<number, number>();
+    this.forEach((x, y, z, c) => {
+      const nx = Math.floor(x / k),
+        ny = Math.floor(y / k),
+        nz = Math.floor(z / k);
+      const kk = key(nx, ny, nz);
+      cnt.set(kk, (cnt.get(kk) ?? 0) + 1);
+      if (!g.map.has(kk)) g.map.set(kk, c);
+    });
+    // убираем почти пустые ячейки, чтобы силуэт не «раздувался»
+    const need = Math.max(1, Math.floor((k * k * k) / 4));
+    for (const [kk, n] of cnt) if (n < need) g.map.delete(kk);
+    return g;
   }
 
   /** origin — точка в воксельных координатах, которая станет (0,0,0) */
@@ -114,11 +170,23 @@ export class VoxelGrid {
 /** Цвет с лёгким шумом — для «живых» поверхностей */
 export function jit(hex: number, x: number, y: number, z: number, amt = 0.08): number {
   const h = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453;
-  const r = (h - Math.floor(h)) * 2 - 1;
-  const c = new THREE.Color(hex);
-  const k = 1 + r * amt;
-  c.r = Math.min(1, c.r * k);
-  c.g = Math.min(1, c.g * k);
-  c.b = Math.min(1, c.b * k);
-  return c.getHex();
+  const k = 1 + ((h - Math.floor(h)) * 2 - 1) * amt;
+  const r = Math.min(255, ((hex >> 16) & 255) * k) | 0;
+  const g = Math.min(255, ((hex >> 8) & 255) * k) | 0;
+  const b = Math.min(255, (hex & 255) * k) | 0;
+  return (r << 16) | (g << 8) | b;
+}
+
+/** Смешивание двух цветов */
+export function mixHex(a: number, b: number, t: number): number {
+  const r = ((a >> 16) & 255) * (1 - t) + ((b >> 16) & 255) * t;
+  const g = ((a >> 8) & 255) * (1 - t) + ((b >> 8) & 255) * t;
+  const bl = (a & 255) * (1 - t) + (b & 255) * t;
+  return ((r | 0) << 16) | ((g | 0) << 8) | (bl | 0);
+}
+
+/** Детерминированный шум 0..1 по координатам */
+export function vhash(x: number, y: number, z: number, s = 0): number {
+  const h = Math.sin(x * 127.1 + y * 311.7 + z * 74.7 + s * 19.19) * 43758.5453;
+  return h - Math.floor(h);
 }
