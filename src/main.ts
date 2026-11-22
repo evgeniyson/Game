@@ -5,13 +5,17 @@ import { Input } from './input/input';
 import { Hud } from './ui/hud';
 import { Menu, type NewGame } from './ui/menu';
 import { Game, loadSave } from './game/game';
-import { initAudio } from './core/audio';
+import { initAudio, setSound } from './core/audio';
+import { settings } from './core/settings';
+import { initIcons } from './render/icons';
 
 const app = document.getElementById('app')!;
 const canvas = document.createElement('canvas');
 app.appendChild(canvas);
 
 const renderer = new Renderer(canvas);
+initIcons(renderer.renderer);
+setSound(settings.sound);
 const input = new Input(app);
 const hud = new Hud(app, input);
 let game: Game | null = null;

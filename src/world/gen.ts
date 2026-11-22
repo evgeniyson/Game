@@ -377,7 +377,7 @@ export class WorldGen {
             sub = B.Sand;
             break;
           case Biome.Snow:
-            surf = h > 30 ? B.Snow : h > 24 ? (hash2(wx, wz, seed) < 0.5 ? B.Snow : B.Stone) : B.DarkGrass;
+            surf = h > 18 ? (hash2(wx, wz, seed) < 0.93 ? B.Snow : B.Stone) : hash2(wx, wz, seed) < 0.75 ? B.Snow : B.DarkGrass;
             sub = B.Stone;
             break;
           case Biome.City:

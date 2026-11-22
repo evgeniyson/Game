@@ -1,7 +1,7 @@
 // Игрок: класс, прокачка способностей, таланты, инвентарь.
 import { Entity } from './entity';
 import { CLASSES, TALENT_LEVELS, type ClassDef, type ClassId } from '../data/classes';
-import { buildCharacter, type Appearance } from '../render/models';
+import { buildCharacter, type Appearance, type CharacterRig } from '../render/models';
 import { Inventory } from '../items/inventory';
 import { ABILITIES, type AbilityDef } from '../combat/abilities';
 import { MAX_LEVEL, xpToNext, type Mods } from '../combat/stats';
@@ -21,6 +21,7 @@ export class Player extends Entity {
   harvest: { key: string; t: number; hits: number } | null = null;
   respawnT = 0;
   kills = 0;
+  private visKey = '';
 
   constructor(clsId: ClassId, appearance: Appearance, name: string) {
     const cls = CLASSES[clsId];
@@ -41,6 +42,24 @@ export class Player extends Entity {
     for (const tier of this.cls.talents) for (const t of tier) if (this.talents.includes(t.id) && t.mods) talentMods.push(t.mods);
     this.staticMods = [...this.inv.equippedMods(), ...talentMods];
     this.recalc();
+    this.updateVisuals();
+  }
+
+  get crig(): CharacterRig {
+    return this.rig as CharacterRig;
+  }
+
+  /** Оружие, щит и головной убор на модели — пересобираем только при изменении */
+  updateVisuals() {
+    const e = this.inv.equip;
+    const k = (it: typeof e.weapon) => (it ? `${it.id}:${it.rarity}:${it.plus}:${it.runes.join('+')}` : '-');
+    const key = [k(e.weapon), k(e.offhand), k(e.head)].join('|');
+    if (key === this.visKey) return;
+    this.visKey = key;
+    const r = this.crig;
+    r.setWeapon(e.weapon?.id ?? null, e.weapon?.rarity ?? 0, e.weapon?.runes ?? [], e.weapon?.plus ?? 0);
+    r.setOffhand(e.offhand?.id ?? null, e.offhand?.rarity ?? 0);
+    r.setHeadgear(e.head?.id ?? null);
   }
 
   /** Правило Dota: Q/E/R-обычные — не выше (уровень+1)/2, ульта на 6/12/18 */

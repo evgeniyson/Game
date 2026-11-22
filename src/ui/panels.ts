@@ -9,7 +9,9 @@ import { describeMods } from '../combat/stats';
 import { TALENT_LEVELS } from '../data/classes';
 import { questTitle } from '../game/quests';
 import { setSound, soundOn, sfx } from '../core/audio';
+import { settings, updateSettings, QUALITY_NAMES, DOF_NAMES, type Quality, type DofMode } from '../core/settings';
 import { IS_TOUCH } from '../render/renderer';
+import { iconNode } from '../render/icons';
 
 type Tab = 'inventory' | 'craft' | 'skills' | 'quests' | 'menu';
 
@@ -123,7 +125,7 @@ export class Panels {
     if (def && it) {
       b.style.borderColor = def.kind === 'gear' ? RARITY[it.rarity].color : 'rgba(255,255,255,.12)';
       if (def.kind === 'gear' && it.rarity > 0) b.style.background = RARITY[it.rarity].color + '22';
-      b.append(def.icon);
+      b.append(iconNode(it.id, def.icon, def.kind === 'gear' ? it.rarity : 0));
       if (it.qty > 1) b.append(el('b', {}, String(it.qty)));
       if (it.plus) b.append(el('span', { class: 'q' }, '+' + it.plus));
       const qi = this.game.player.inv.quick.indexOf(it.uid);
@@ -208,7 +210,7 @@ export class Panels {
     }
     const def = ITEMS[it.id];
     const color = def.kind === 'gear' ? RARITY[it.rarity].color : '#f4f1e8';
-    box.append(el('div', { class: 'nm', style: { color } }, `${def.icon} ${itemName(it)}`));
+    box.append(el('div', { class: 'nm', style: { color, display: 'flex', alignItems: 'center', gap: '8px' } }, el('span', { class: 'big-ico' }, iconNode(it.id, def.icon, def.kind === 'gear' ? it.rarity : 0)), itemName(it)));
     const sub: string[] = [];
     if (def.kind === 'gear') {
       sub.push(RARITY[it.rarity].name, SLOT_NAMES[def.slot!], `ур. предмета ${it.ilvl}`);
@@ -373,7 +375,7 @@ export class Panels {
         el(
           'div',
           { class: 'recipe' + (chk.ok && avail ? '' : ' dis') },
-          el('div', { class: 'ic' }, def.icon),
+          el('div', { class: 'ic' }, iconNode(def.id, def.icon, 1)),
           el('div', { class: 'info' }, el('div', { class: 'n' }, `${def.name}${(r.qty ?? 1) > 1 ? ' ×' + r.qty : ''}${def.tradeoff ? ' ⚖️' : ''}`), el('div', { class: 'in', style: { color: '#d8d2c0' } }, stats), ins),
           b,
         ),
@@ -480,8 +482,26 @@ export class Panels {
     });
     b(soundOn ? '🔊 Звук: вкл' : '🔇 Звук: выкл', () => {
       setSound(!soundOn);
+      updateSettings({ sound: soundOn });
       this.render();
     });
+    const row = (label: string, opts: [string, string][], cur: string, set: (v: string) => void) => {
+      const r = el('div', { class: 'sw-row', style: { alignItems: 'center' } }, el('span', { style: { fontWeight: '800', fontSize: '13px', minWidth: '120px' } }, label));
+      for (const [v, name] of opts) {
+        const e = el('button', { class: 'btn' + (v === cur ? ' gold' : '') }, name);
+        e.addEventListener('click', () => {
+          set(v);
+          this.render();
+        });
+        r.append(e);
+      }
+      btns.append(r);
+    };
+    row('🎨 Графика', Object.entries(QUALITY_NAMES), settings.quality, (v) => {
+      updateSettings({ quality: v as Quality });
+      g.grass.rebuild();
+    });
+    row('📷 Диорама', Object.entries(DOF_NAMES), settings.dof, (v) => updateSettings({ dof: v as DofMode }));
     b('🗑️ Новая игра (удалить сохранение)', () => {
       if (confirm('Удалить сохранение и начать заново?')) {
         clearSave();

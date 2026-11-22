@@ -84,6 +84,26 @@ export class VoxelGrid {
     for (const [k, c] of this.map) fn((k & 1023) - 512, ((k >>> 10) & 1023) - 512, ((k >>> 20) & 1023) - 512, c);
   }
 
+  /** Мельче в k раз: каждый воксель -> k³, со скруглёнными внешними углами и микро-шумом цвета */
+  refine(k = 2): VoxelGrid {
+    const out = new VoxelGrid();
+    this.forEach((x, y, z, c) => {
+      for (let sx = 0; sx < k; sx++)
+        for (let sy = 0; sy < k; sy++)
+          for (let sz = 0; sz < k; sz++) {
+            const dx = sx === 0 ? -1 : sx === k - 1 ? 1 : 0;
+            const dy = sy === 0 ? -1 : sy === k - 1 ? 1 : 0;
+            const dz = sz === 0 ? -1 : sz === k - 1 ? 1 : 0;
+            if (dx && dy && dz && !this.has(x + dx, y, z) && !this.has(x, y + dy, z) && !this.has(x, y, z + dz)) continue;
+            const X = x * k + sx,
+              Y = y * k + sy,
+              Z = z * k + sz;
+            out.set(X, Y, Z, jit(c, X, Y, Z, 0.05));
+          }
+    });
+    return out;
+  }
+
   /** Грубая версия модели для дальнего LOD */
   downsample(k: number): VoxelGrid {
     const g = new VoxelGrid();

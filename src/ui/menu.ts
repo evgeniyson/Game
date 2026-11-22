@@ -176,7 +176,11 @@ export class Menu {
     }
     const pv = this.prev;
     if (pv.rig) pv.scene.remove(pv.rig.group);
-    pv.rig = buildCharacter(this.ap);
+    const cr = buildCharacter(this.ap);
+    const start = CLASSES[this.ap.cls].startItems;
+    cr.setWeapon(start[0], 1);
+    cr.setOffhand(start[1], 0);
+    pv.rig = cr;
     pv.rig.group.scale.setScalar(1.15);
     pv.scene.add(pv.rig.group);
     box.append(pv.r.domElement);
