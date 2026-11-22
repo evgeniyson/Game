@@ -1,9 +1,10 @@
 // Стриминг чанков вокруг игрока, высоты для коллизий, декорации и добыча ресурсов.
 import * as THREE from 'three';
 import { CHUNK, SEA, WorldGen, Biome } from './gen';
-import { decoGeometries, SMALL_DECO } from '../render/decoModels';
-import { HARVEST, D } from './decoTypes';
+import { HARVEST, COLLIDERS, D } from './decoTypes';
 import type { MeshArrays } from './mesher';
+import { makeTerrainMaterial, makeWaterMaterial } from '../render/terrainMaterial';
+import { DecoRenderer, DECO_STRIDE } from '../render/decoRenderer';
 
 interface ChunkRec {
   cx: number;
@@ -14,8 +15,6 @@ interface ChunkRec {
   decos: Float32Array;
   hidden: Set<number>;
   group: THREE.Group;
-  decoMesh: THREE.Mesh | null;
-  smallMesh: THREE.Mesh | null;
   blockers: { x: number; z: number; r: number; i: number }[];
 }
 
@@ -37,17 +36,19 @@ export class World {
   private rr = 0;
   private opaqueMat: THREE.MeshLambertMaterial;
   private waterMat: THREE.MeshLambertMaterial;
-  private decoMat: THREE.MeshLambertMaterial;
+  decoRenderer: DecoRenderer;
   harvested = new Map<string, number>(); // ключ деко -> игровое время возрождения
   radius = 2;
   time = 0;
+  private pcx = 1e9;
+  private pcz = 1e9;
   onChunkLoaded: (cx: number, cz: number) => void = () => {};
 
   constructor(public scene: THREE.Scene, public seed: number) {
     this.gen = new WorldGen(seed);
-    this.opaqueMat = new THREE.MeshLambertMaterial({ vertexColors: true });
-    this.waterMat = new THREE.MeshLambertMaterial({ vertexColors: true, transparent: true, opacity: 0.72, depthWrite: false });
-    this.decoMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    this.opaqueMat = makeTerrainMaterial();
+    this.waterMat = makeWaterMaterial();
+    this.decoRenderer = new DecoRenderer(scene);
     const n = Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 2) - 1));
     for (let i = 0; i < n; i++) {
       const w = new Worker(new URL('./chunk.worker.ts', import.meta.url), { type: 'module' });
@@ -59,7 +60,8 @@ export class World {
 
   dispose() {
     for (const w of this.workers) w.terminate();
-    for (const c of this.chunks.values()) this.unload(c);
+    for (const c of [...this.chunks.values()]) this.unload(c);
+    this.decoRenderer.dispose();
   }
 
   get loadingCount() {
@@ -69,6 +71,11 @@ export class World {
   update(px: number, pz: number) {
     const pcx = Math.floor(px / CHUNK);
     const pcz = Math.floor(pz / CHUNK);
+    if (pcx !== this.pcx || pcz !== this.pcz) {
+      this.pcx = pcx;
+      this.pcz = pcz;
+      this.decoRenderer.dirty = true;
+    }
     const R = this.radius;
     const want: [number, number, number][] = [];
     for (let dz = -R; dz <= R; dz++)
@@ -85,9 +92,10 @@ export class World {
       this.pending.add(k);
       this.workers[this.rr++ % this.workers.length].postMessage({ type: 'gen', cx, cz });
     }
-    for (const c of this.chunks.values()) {
+    for (const c of [...this.chunks.values()]) {
       if (Math.abs(c.cx - pcx) > R + 1 || Math.abs(c.cz - pcz) > R + 1) this.unload(c);
     }
+    if (this.decoRenderer.dirty) this.decoRenderer.rebuild(this.chunks.values(), pcx, pcz);
   }
 
   private unload(c: ChunkRec) {
@@ -96,6 +104,7 @@ export class World {
       if (o instanceof THREE.Mesh) o.geometry.dispose();
     });
     this.chunks.delete(ckey(c.cx, c.cz));
+    this.decoRenderer.dirty = true;
   }
 
   private toGeo(m: MeshArrays): THREE.BufferGeometry {
@@ -124,86 +133,41 @@ export class World {
       water.renderOrder = 1;
       group.add(water);
     }
-    const rec: ChunkRec = {
-      cx: d.cx, cz: d.cz, heights: d.heights, tops: d.tops, biomes: d.biomes, decos: d.decos,
-      hidden: new Set(), group, decoMesh: null, smallMesh: null, blockers: [],
-    };
-    const n = rec.decos.length / 6;
+    const rec: ChunkRec = { cx: d.cx, cz: d.cz, heights: d.heights, tops: d.tops, biomes: d.biomes, decos: d.decos, hidden: new Set(), group, blockers: [] };
+    const n = rec.decos.length / DECO_STRIDE;
     for (let i = 0; i < n; i++) {
-      const key = `${d.cx},${d.cz},${i}`;
-      const t = this.harvested.get(key);
+      const t = this.harvested.get(`${d.cx},${d.cz},${i}`);
       if (t !== undefined && t > this.time) rec.hidden.add(i);
     }
-    this.rebuildDecos(rec);
+    this.rebuildBlockers(rec);
     this.chunks.set(k, rec);
     this.scene.add(group);
+    this.decoRenderer.dirty = true;
     this.onChunkLoaded(d.cx, d.cz);
   }
 
-  /** Сливает все декорации чанка в 2 меша (с тенью и без) */
-  private rebuildDecos(rec: ChunkRec) {
-    const geos = decoGeometries();
-    if (rec.decoMesh) {
-      rec.group.remove(rec.decoMesh);
-      rec.decoMesh.geometry.dispose();
-    }
-    if (rec.smallMesh) {
-      rec.group.remove(rec.smallMesh);
-      rec.smallMesh.geometry.dispose();
-    }
+  /** Коллизии декораций и построек чанка */
+  private rebuildBlockers(rec: ChunkRec) {
     rec.blockers = [];
-    const big: { p: number[]; n: number[]; c: number[]; i: number[] } = { p: [], n: [], c: [], i: [] };
-    const small: { p: number[]; n: number[]; c: number[]; i: number[] } = { p: [], n: [], c: [], i: [] };
-    const ox = rec.cx * CHUNK,
-      oz = rec.cz * CHUNK;
-    const cnt = rec.decos.length / 6;
-    for (let k = 0; k < cnt; k++) {
-      const t = rec.decos[k * 6] as D;
-      const x = rec.decos[k * 6 + 1] - ox,
-        y = rec.decos[k * 6 + 2],
-        z = rec.decos[k * 6 + 3] - oz;
-      const rot = rec.decos[k * 6 + 4],
-        s = rec.decos[k * 6 + 5];
-      const hv = HARVEST[t];
-      if (rec.hidden.has(k)) continue;
-      if (hv?.block) rec.blockers.push({ x: x + ox, z: z + oz, r: hv.radius * s, i: k });
-      const g = geos[t];
-      const dst = SMALL_DECO.has(t) ? small : big;
-      const pos = g.attributes.position.array as Float32Array;
-      const nor = g.attributes.normal.array as Float32Array;
-      const col = g.attributes.color.array as Float32Array;
-      const idx = g.index!.array;
-      const base = dst.p.length / 3;
-      const cs = Math.cos(rot),
-        sn = Math.sin(rot);
-      for (let v = 0; v < pos.length; v += 3) {
-        const px = pos[v] * s,
-          py = pos[v + 1] * s,
-          pz = pos[v + 2] * s;
-        dst.p.push(x + px * cs + pz * sn, y + py, z - px * sn + pz * cs);
-        const nx = nor[v],
-          nz = nor[v + 2];
-        dst.n.push(nx * cs + nz * sn, nor[v + 1], -nx * sn + nz * cs);
-        dst.c.push(col[v], col[v + 1], col[v + 2]);
+    const n = rec.decos.length / DECO_STRIDE;
+    for (let i = 0; i < n; i++) {
+      if (rec.hidden.has(i)) continue;
+      const o = i * DECO_STRIDE;
+      const t = rec.decos[o] as D;
+      const x = rec.decos[o + 1],
+        z = rec.decos[o + 3],
+        rot = rec.decos[o + 4],
+        s = rec.decos[o + 5];
+      const col = COLLIDERS[t];
+      if (col) {
+        const cs = Math.cos(rot),
+          sn = Math.sin(rot);
+        for (const [dx, dz, r] of col) rec.blockers.push({ x: x + (dx * cs + dz * sn) * s, z: z + (-dx * sn + dz * cs) * s, r: r * s, i });
+      } else {
+        const hv = HARVEST[t];
+        if (hv?.block) rec.blockers.push({ x, z, r: hv.radius * s, i });
       }
-      for (let i = 0; i < idx.length; i++) dst.i.push(idx[i] + base);
     }
-    const mk = (b: typeof big, shadow: boolean) => {
-      if (!b.i.length) return null;
-      const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.Float32BufferAttribute(b.p, 3));
-      g.setAttribute('normal', new THREE.Float32BufferAttribute(b.n, 3));
-      g.setAttribute('color', new THREE.Float32BufferAttribute(b.c, 3));
-      g.setIndex(b.i);
-      g.computeBoundingSphere();
-      const m = new THREE.Mesh(g, this.decoMat);
-      m.castShadow = shadow;
-      m.receiveShadow = true;
-      rec.group.add(m);
-      return m;
-    };
-    rec.decoMesh = mk(big, true);
-    rec.smallMesh = mk(small, false);
   }
 
   private recAt(x: number, z: number): ChunkRec | undefined {
@@ -255,12 +219,17 @@ export class World {
       if (h < SEA - 1) return false;
     }
     if (!ignoreDecos) {
-      const rec = this.recAt(x, z);
-      if (rec)
-        for (const b of rec.blockers) {
-          const dx = b.x - x,
-            dz = b.z - z;
-          if (dx * dx + dz * dz < (b.r + r) * (b.r + r)) return false;
+      const ccx = Math.floor(x / CHUNK),
+        ccz = Math.floor(z / CHUNK);
+      for (let ox = -1; ox <= 1; ox++)
+        for (let oz = -1; oz <= 1; oz++) {
+          const rec = this.chunks.get(ckey(ccx + ox, ccz + oz));
+          if (!rec) continue;
+          for (const b of rec.blockers) {
+            const dx = b.x - x,
+              dz = b.z - z;
+            if (dx * dx + dz * dz < (b.r + r) * (b.r + r)) return false;
+          }
         }
     }
     return true;
@@ -278,17 +247,17 @@ export class World {
       for (let dz = -1; dz <= 1; dz++) {
         const rec = this.chunks.get(ckey(Math.floor(pos.x / CHUNK) + dx, Math.floor(pos.z / CHUNK) + dz));
         if (!rec) continue;
-        const n = rec.decos.length / 6;
+        const n = rec.decos.length / DECO_STRIDE;
         for (let i = 0; i < n; i++) {
-          const t = rec.decos[i * 6] as D;
+          const t = rec.decos[i * DECO_STRIDE] as D;
           const hv = HARVEST[t];
           if (!hv || rec.hidden.has(i)) continue;
-          const x = rec.decos[i * 6 + 1],
-            z = rec.decos[i * 6 + 3];
-          const d = Math.hypot(x - pos.x, z - pos.z) - hv.radius * rec.decos[i * 6 + 5];
+          const x = rec.decos[i * DECO_STRIDE + 1],
+            z = rec.decos[i * DECO_STRIDE + 3];
+          const d = Math.hypot(x - pos.x, z - pos.z) - hv.radius * rec.decos[i * DECO_STRIDE + 5];
           if (d < bd) {
             bd = d;
-            best = { key: `${rec.cx},${rec.cz},${i}`, rec, index: i, type: t, pos: new THREE.Vector3(x, rec.decos[i * 6 + 2], z) };
+            best = { key: `${rec.cx},${rec.cz},${i}`, rec, index: i, type: t, pos: new THREE.Vector3(x, rec.decos[i * DECO_STRIDE + 2], z) };
           }
         }
       }
@@ -299,7 +268,8 @@ export class World {
     const hv = HARVEST[h.type]!;
     h.rec.hidden.add(h.index);
     this.harvested.set(h.key, this.time + hv.respawn);
-    this.rebuildDecos(h.rec);
+    this.rebuildBlockers(h.rec);
+    this.decoRenderer.dirty = true;
   }
 
   /** Периодически возвращаем срубленные деревья и т.п. */
@@ -309,7 +279,10 @@ export class World {
       this.harvested.delete(key);
       const [cx, cz, i] = key.split(',').map(Number);
       const rec = this.chunks.get(ckey(cx, cz));
-      if (rec && rec.hidden.delete(i)) this.rebuildDecos(rec);
+      if (rec && rec.hidden.delete(i)) {
+        this.rebuildBlockers(rec);
+        this.decoRenderer.dirty = true;
+      }
     }
   }
 

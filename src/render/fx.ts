@@ -15,7 +15,7 @@ interface Timed {
   obj: THREE.Object3D;
   t: number;
   max: number;
-  kind: 'ring' | 'line' | 'bolt';
+  kind: 'ring' | 'line' | 'bolt' | 'slash';
   r?: number;
 }
 
@@ -28,7 +28,7 @@ export class FX {
   private discGeo = new THREE.CircleGeometry(1, 40).rotateX(-Math.PI / 2);
   private planeGeo = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2).translate(0, 0, 0.5);
   onShake: (a: number) => void = () => {};
-  readonly MAX = 900;
+  readonly MAX = 1400;
 
   // Индикаторы прицеливания
   aimRange: THREE.Mesh;
@@ -80,6 +80,12 @@ export class FX {
     }
   }
 
+  /** Частица с заданной скоростью (снег, пыль, листья, пыльца) */
+  drift(pos: THREE.Vector3, color: number, vel: THREE.Vector3, size: number, life: number, grav = 0) {
+    if (this.particles.length >= this.MAX) this.particles.shift();
+    this.particles.push({ pos: pos.clone(), vel: vel.clone(), life: 0, max: life, size, color: new THREE.Color(color), grav });
+  }
+
   ring(pos: THREE.Vector3, radius: number, color: number, dur = 0.4) {
     const m = new THREE.Mesh(this.ringGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthWrite: false, toneMapped: false }));
     m.position.copy(pos).setY(pos.y + 0.08);
@@ -97,6 +103,17 @@ export class FX {
     m.renderOrder = 3;
     this.scene.add(m);
     this.timed.push({ obj: m, t: 0, max: dur, kind: 'line' });
+  }
+
+  /** След взмаха оружием ближнего боя — светящаяся дуга */
+  slash(pos: THREE.Vector3, facing: number, color: number) {
+    const geo = new THREE.RingGeometry(0.9, 1.7, 24, 1, -1.2, 2.4).rotateX(-Math.PI / 2);
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.75, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, toneMapped: false }));
+    m.position.copy(pos).setY(pos.y + 1.0);
+    m.rotation.set(0.25, facing + Math.PI / 2, 0, 'YXZ');
+    m.renderOrder = 4;
+    this.scene.add(m);
+    this.timed.push({ obj: m, t: 0, max: 0.22, kind: 'slash' });
   }
 
   lightning(points: THREE.Vector3[], color: number) {
@@ -139,7 +156,7 @@ export class FX {
     o.traverse((c) => {
       const m = (c as THREE.Mesh).material as THREE.Material | undefined;
       if (m) m.dispose();
-      if (c instanceof THREE.Line) c.geometry.dispose();
+      if (c instanceof THREE.Line || (c instanceof THREE.Mesh && c.geometry.type === 'RingGeometry' && c.geometry !== this.ringGeo)) c.geometry.dispose();
     });
   }
 
@@ -180,6 +197,10 @@ export class FX {
         t.obj.scale.setScalar(t.r! * (0.3 + 0.7 * Math.min(1, k * 1.6)));
         mat.opacity = 0.9 * (1 - k);
       } else if (t.kind === 'line') mat.opacity = 0.45 * (1 - k);
+      else if (t.kind === 'slash') {
+        mat.opacity = 0.75 * (1 - k);
+        t.obj.scale.setScalar(1 + k * 0.3);
+      }
       else mat.opacity = 1 - k;
       return true;
     });

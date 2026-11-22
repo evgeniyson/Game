@@ -3,7 +3,7 @@
 import { createNoise2D, type NoiseFunction2D } from 'simplex-noise';
 import { mulberry32, hash2, hash3 } from '../core/rng';
 import { B } from './blocks';
-import { D } from './decoTypes';
+import { D, VARIANTS } from './decoTypes';
 
 export const CHUNK = 32;
 export const HEIGHT = 64;
@@ -31,7 +31,7 @@ export interface ChunkData {
   heights: Uint8Array; // CHUNK*CHUNK, высота, на которой стоит существо (верх твёрдого блока + 1)
   tops: Uint8Array; // CHUNK*CHUNK, id верхнего блока (для миникарты)
   biomes: Uint8Array; // CHUNK*CHUNK
-  decos: Float32Array; // stride 6: type,x,y,z,rot,scale
+  decos: Float32Array; // stride 7: type,x,y,z,rot,scale,variant
 }
 
 export const pidx = (x: number, y: number, z: number) => x + 1 + (z + 1) * PAD + y * PAD * PAD;
@@ -46,6 +46,32 @@ export interface Colossus {
   x: number;
   z: number;
   rot: number; // 0..3 — поворот на 90°
+}
+
+/** Ящики, бочки, фонари и скамьи в лагере: [тип, x, z, поворот, вариант] */
+const CAMP_PROPS: [D, number, number, number, number][] = [
+  [D.Crate, -7.5, -11.5, 0.2, 0], [D.Crate, -8.6, -12.3, 0.9, 1], [D.Barrel, 7.8, -11.8, 0, 0], [D.Barrel, 8.7, -10.9, 0, 1],
+  [D.LogPile, -13.5, 4.5, Math.PI / 2, 0], [D.Bench, 2.5, 3.5, 0, 0], [D.Bench, -2.5, -3.2, Math.PI, 0],
+  [D.Lantern, 2.6, 1.8, 0, 0], [D.Lantern, -2.2, -1.6, 0, 0], [D.LampPost, 2.6, 15.2, 0, 0], [D.LampPost, -2.4, -15.2, Math.PI, 0],
+  [D.Crate, 12.4, 5.6, 0.4, 0], [D.Suitcase, 10.6, 9.8, 0.5, 1], [D.Signpost, 3.2, 17.5, 0.1, 0],
+];
+
+export interface SitePiece {
+  t: D;
+  x: number;
+  z: number;
+  rot: number;
+  s: number;
+  v: number;
+}
+
+export interface Site {
+  kind: 'ruins' | 'cabins' | 'crash';
+  x: number;
+  z: number;
+  baseH: number;
+  radius: number;
+  pieces: SitePiece[];
 }
 
 interface Building {
@@ -129,8 +155,19 @@ export class WorldGen {
     return s / t;
   }
 
-  /** Возвращает [высоту поверхности (верхний твёрдый блок), биом] без учёта построек */
+  /** Высота и биом с учётом выравнивания площадок под «места» */
   sample(x: number, z: number): { h: number; biome: Biome; city: number } {
+    const b = this.sampleBase(x, z);
+    for (const st of this.sitesNear(x, z)) {
+      const d = Math.hypot(x - st.x, z - st.z);
+      const f = 1 - smooth(st.radius, st.radius + 10, d);
+      if (f > 0) b.h = Math.floor(lerp(b.h, st.baseH, f) + 0.5);
+    }
+    return b;
+  }
+
+  /** Возвращает [высоту поверхности (верхний твёрдый блок), биом] без учёта построек */
+  sampleBase(x: number, z: number): { h: number; biome: Biome; city: number } {
     const d = Math.hypot(x, z);
     const far = smooth(40, 70, d);
     const temp = this.fbm(this.nTemp, x / 520, z / 520, 2);
@@ -176,6 +213,108 @@ export class WorldGen {
     else biome = Biome.Meadow;
 
     return { h: Math.max(1, Math.min(HEIGHT - 8, Math.floor(h))), biome, city };
+  }
+
+  // ---------- «Места»: руины, избы, крушения ----------
+  static readonly SITE = 96;
+  private siteCache = new Map<string, Site | null>();
+
+  siteInCell(gx: number, gz: number): Site | null {
+    const key = gx + ',' + gz;
+    if (this.siteCache.has(key)) return this.siteCache.get(key)!;
+    const site = this.makeSite(gx, gz);
+    this.siteCache.set(key, site);
+    return site;
+  }
+
+  sitesNear(x: number, z: number): Site[] {
+    const S = WorldGen.SITE;
+    const gx = Math.floor(x / S),
+      gz = Math.floor(z / S);
+    const out: Site[] = [];
+    for (let i = -1; i <= 1; i++)
+      for (let j = -1; j <= 1; j++) {
+        const st = this.siteInCell(gx + i, gz + j);
+        if (st && Math.abs(st.x - x) < st.radius + 12 && Math.abs(st.z - z) < st.radius + 12) out.push(st);
+      }
+    return out;
+  }
+
+  private makeSite(gx: number, gz: number): Site | null {
+    const S = WorldGen.SITE;
+    const r = mulberry32(Math.floor(hash2(gx, gz, this.seed ^ 0x517e) * 1e9));
+    const x = Math.floor(gx * S + 24 + r() * (S - 48)) + 0.5;
+    const z = Math.floor(gz * S + 24 + r() * (S - 48)) + 0.5;
+    if (Math.hypot(x, z) < 80) return null;
+    for (const c of this.colossiNear(x, z)) if (Math.hypot(c.x - x, c.z - z) < 62) return null;
+    const base = this.sampleBase(x, z);
+    if (base.h <= SEA + 1 || base.city > 0.3) return null;
+    const roll = r();
+    let kind: Site['kind'] | null = null;
+    if (base.biome === Biome.Desert) kind = roll < 0.75 ? 'ruins' : roll < 0.9 ? 'crash' : null;
+    else if (base.biome === Biome.Snow) kind = roll < 0.7 ? 'cabins' : null;
+    else if (base.biome === Biome.Forest) kind = roll < 0.35 ? 'cabins' : roll < 0.5 ? 'crash' : null;
+    else if (base.biome === Biome.Meadow) kind = roll < 0.3 ? 'crash' : null;
+    if (!kind) return null;
+    const rot = Math.floor(r() * 4) * (Math.PI / 2);
+    const pieces: SitePiece[] = [];
+    const add = (t: D, px: number, pz: number, prot = 0, sc = 1, v = Math.floor(r() * VARIANTS[t])) => pieces.push({ t, x: px, z: pz, rot: prot, s: sc, v });
+    const ring = (n: number, r0: number, r1: number, fn: (px: number, pz: number, a: number) => void) => {
+      for (let i = 0; i < n; i++) {
+        const a = r() * Math.PI * 2,
+          d = r0 + r() * (r1 - r0);
+        fn(Math.cos(a) * d, Math.sin(a) * d, a);
+      }
+    };
+    let radius = 12;
+    if (kind === 'ruins') {
+      radius = 17;
+      add(D.Colonnade, 0, 0, 0, 1, 0);
+      ring(5, 6, 12, (px, pz) => add(r() < 0.45 ? D.Column : D.ColumnBroken, px, pz, r() * Math.PI * 2));
+      add(D.Arch, 10 * (r() < 0.5 ? 1 : -1), 6 * (r() < 0.5 ? 1 : -1), Math.PI / 2, 1, 0);
+      if (r() < 0.7) add(D.Aqueduct, 0, -13, 0, 1, 0);
+      ring(6, 4, 15, (px, pz) => add(D.Rubble, px, pz, r() * 6.28));
+      ring(3, 8, 16, (px, pz) => add(D.SandMound, px, pz, r() * 6.28));
+      ring(2, 10, 16, (px, pz) => add(D.DeadTree, px, pz, r() * 6.28, 1.2, Math.floor(r() * 2)));
+    } else if (kind === 'cabins') {
+      radius = 14;
+      const snowy = base.biome === Biome.Snow ? 1 : 0;
+      add(D.Cabin, 0, -1, 0, 1, snowy);
+      if (r() < 0.5) add(D.Cabin, -12, -2, Math.PI / 2, 1, snowy);
+      for (const fx of [-7.5, -4.5, 4.5, 7.5]) add(D.Fence, fx, 7.5, 0, 1, snowy);
+      for (const fx of [-7.5, -4.5, -1.5, 1.5, 4.5, 7.5]) add(D.Fence, fx, -7.5, 0, 1, snowy);
+      for (const fz of [-6, -3, 0, 3, 6]) {
+        add(D.Fence, 9, fz, Math.PI / 2, 1, snowy);
+        if (pieces.every((p) => p.t !== D.Cabin || p.x > -5)) add(D.Fence, -9, fz, Math.PI / 2, 1, snowy);
+      }
+      add(D.LampPost, 2.8, 8.5, 0, 1, 0);
+      add(D.LogPile, 6, 2.5, Math.PI / 2, 1, snowy);
+      add(D.Bench, -5.5, 4.5, 0, 1, 0);
+      add(D.Signpost, -2.6, 9.5, 0.3, 1, 0);
+      add(D.Lantern, 1.6, 3.6, 0, 1, 0);
+      ring(7, 11, 15, (px, pz) => add(D.TreePine, px, pz, r() * 6.28, 0.9 + r() * 0.5, snowy ? 2 : Math.floor(r() * 2)));
+    } else {
+      radius = 10;
+      const plane = r() < 0.7;
+      add(plane ? D.PlaneWreck : D.TruckWreck, 0, 0, r() * 0.6 - 0.3, 1, 0);
+      ring(4, 3.5, 7, (px, pz) => add(D.Crate, px, pz, r() * 6.28));
+      ring(2, 4, 7, (px, pz) => add(D.Barrel, px, pz, r() * 6.28));
+      ring(3, 3, 8, (px, pz) => add(D.Suitcase, px, pz, r() * 6.28));
+      ring(2, 5, 9, (px, pz) => add(D.Rubble, px, pz, r() * 6.28, 1, 2));
+      const ca = r() * Math.PI * 2;
+      add(D.Chest, Math.cos(ca) * 5, Math.sin(ca) * 5, ca + Math.PI / 2, 1, 0);
+    }
+    // поворот всего места
+    const cs = Math.cos(rot),
+      sn = Math.sin(rot);
+    for (const p of pieces) {
+      const lx = p.x,
+        lz = p.z;
+      p.x = x + lx * cs + lz * sn;
+      p.z = z - lx * sn + lz * cs;
+      p.rot += rot;
+    }
+    return { kind, x, z, baseH: base.h, radius, pieces };
   }
 
   // ---------- Постройки ----------
@@ -238,7 +377,7 @@ export class WorldGen {
             sub = B.Sand;
             break;
           case Biome.Snow:
-            surf = h > 30 ? B.Snow : h > 24 ? (hash2(wx, wz, seed) < 0.5 ? B.Snow : B.Stone) : B.DarkGrass;
+            surf = h > 18 ? (hash2(wx, wz, seed) < 0.93 ? B.Snow : B.Stone) : hash2(wx, wz, seed) < 0.75 ? B.Snow : B.DarkGrass;
             sub = B.Stone;
             break;
           case Biome.City:
@@ -512,8 +651,26 @@ export class WorldGen {
   private placeDecos(ox: number, oz: number, blocks: Uint8Array, heights: Uint8Array, biomes: Uint8Array): Float32Array {
     const out: number[] = [];
     const seed = this.seed ^ 0xdec0;
-    const add = (t: D, x: number, y: number, z: number, s = 1) => out.push(t, x, y, z, Math.floor(hash2(x * 7, z * 3, seed) * 4) * (Math.PI / 2) + hash2(x, z, seed + 3) * 0.4 - 0.2, s);
+    const add = (t: D, x: number, y: number, z: number, s = 1, v = -1) =>
+      out.push(t, x, y, z, hash2(x * 7, z * 3, seed) * Math.PI * 2, s, v >= 0 ? v : Math.floor(hash2(x * 3, z * 5, seed + 7) * VARIANTS[t]));
     const dist0 = Math.hypot(ox + 16, oz + 16);
+    const sites = this.sitesNear(ox + 16, oz + 16).filter((st) => Math.abs(st.x - (ox + 16)) < st.radius + 20 && Math.abs(st.z - (oz + 16)) < st.radius + 20);
+    // реквизит лагеря
+    if (Math.abs(ox + 16) < 48 && Math.abs(oz + 16) < 48)
+      for (const [t, px, pz, rot, v] of CAMP_PROPS) {
+        const lx = Math.floor(px) - ox,
+          lz = Math.floor(pz) - oz;
+        if (lx < 0 || lz < 0 || lx >= CHUNK || lz >= CHUNK) continue;
+        out.push(t, px, heights[lx + lz * CHUNK], pz, rot, 1, v);
+      }
+    // куски «мест», чья опорная точка в этом чанке
+    for (const st of sites)
+      for (const p of st.pieces) {
+        const lx = Math.floor(p.x) - ox,
+          lz = Math.floor(p.z) - oz;
+        if (lx < 0 || lz < 0 || lx >= CHUNK || lz >= CHUNK) continue;
+        out.push(p.t, p.x, heights[lx + lz * CHUNK], p.z, p.rot, p.s, p.v);
+      }
     for (let lz = 0; lz < CHUNK; lz++)
       for (let lx = 0; lx < CHUNK; lx++) {
         const i = lx + lz * CHUNK;
@@ -527,6 +684,7 @@ export class WorldGen {
         const x = wx + 0.5,
           z = wz + 0.5;
         const biome = biomes[i] as Biome;
+        if (sites.some((st) => Math.hypot(st.x - x, st.z - z) < st.radius * 0.8)) continue;
         const natural = top === B.Grass || top === B.DarkGrass || top === B.Sand || top === B.Snow || top === B.Mud || top === B.Moss;
         const far = Math.hypot(wx, wz);
         if (top === B.Asphalt && biome === Biome.City) {
@@ -552,26 +710,27 @@ export class WorldGen {
             else if (r < 0.03) add(D.Rock, x, h, z, 0.7 + r2 * 0.6);
             else if (r < 0.034) add(D.Herb, x, h, z);
             else if (r < 0.036 && dist0 > 60) add(D.Car, x, h, z);
-            else if (r < 0.07) add(D.FlowerRed, x, h, z);
-            else if (r < 0.1) add(D.FlowerYellow, x, h, z);
-            else if (r < 0.22) add(D.GrassTuft, x, h, z);
+            else if (r < 0.05) add(D.FlowerRed, x, h, z);
+            else if (r < 0.065) add(D.FlowerYellow, x, h, z);
+            else if (r < 0.1) add(D.GrassTuft, x, h, z);
             break;
           case Biome.Forest:
-            if (r < 0.035) add(D.TreeOak, x, h, z, 0.9 + r2 * 0.6);
-            else if (r < 0.06) add(D.TreePine, x, h, z, 0.9 + r2 * 0.5);
-            else if (r < 0.075) add(D.Bush, x, h, z);
-            else if (r < 0.085) add(D.Mushroom, x, h, z);
-            else if (r < 0.09) add(D.Herb, x, h, z);
-            else if (r < 0.093) add(D.Rock, x, h, z);
-            else if (r < 0.2) add(D.GrassTuft, x, h, z);
+            if (r < 0.022) add(D.TreeOak, x, h, z, 0.9 + r2 * 0.5);
+            else if (r < 0.038) add(D.TreePine, x, h, z, 0.9 + r2 * 0.5, Math.floor(r2 * 2));
+            else if (r < 0.042) add(D.TreeBirch, x, h, z, 0.9 + r2 * 0.3);
+            else if (r < 0.055) add(D.Bush, x, h, z);
+            else if (r < 0.064) add(D.Mushroom, x, h, z);
+            else if (r < 0.068) add(D.Herb, x, h, z);
+            else if (r < 0.072) add(D.Rock, x, h, z);
+            else if (r < 0.1) add(D.GrassTuft, x, h, z);
             break;
           case Biome.City:
             if (r < 0.008) add(D.TreeOak, x, h, z, 0.8 + r2 * 0.4);
             else if (r < 0.03) add(D.Bush, x, h, z);
             else if (r < 0.034) add(D.ScrapPile, x, h, z);
             else if (r < 0.037) add(D.TrashBin, x, h, z);
-            else if (r < 0.06) add(D.FlowerYellow, x, h, z);
-            else if (r < 0.25) add(D.GrassTuft, x, h, z);
+            else if (r < 0.05) add(D.FlowerYellow, x, h, z);
+            else if (r < 0.1) add(D.GrassTuft, x, h, z);
             break;
           case Biome.Swamp:
             if (r < 0.012) add(D.DeadTree, x, h, z, 0.8 + r2 * 0.5);
@@ -588,7 +747,7 @@ export class WorldGen {
             else if (r < 0.0175) add(D.Van, x, h, z);
             break;
           case Biome.Snow:
-            if (r < 0.03) add(D.TreePine, x, h, z, 0.8 + r2 * 0.6);
+            if (r < 0.026) add(D.TreePine, x, h, z, 0.8 + r2 * 0.6, h > 24 || r2 < 0.6 ? 2 : Math.floor(r2 * 2));
             else if (r < 0.042) add(D.Rock, x, h, z, 0.8 + r2);
             else if (r < 0.046) add(D.Crystal, x, h, z);
             break;

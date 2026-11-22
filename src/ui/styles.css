@@ -237,3 +237,9 @@ button { font-family: inherit; color: inherit; }
   .combat { transform: scale(.82); transform-origin: right bottom; }
   .quick { bottom: calc(10px + var(--safe-b)); }
 }
+
+.ico { width: 82%; height: 82%; object-fit: contain; image-rendering: auto; pointer-events: none; filter: drop-shadow(0 2px 2px rgba(0,0,0,.45)); }
+.recipe .ic .ico { width: 40px; height: 40px; }
+.big-ico { width: 44px; height: 44px; display: inline-grid; place-items: center; font-size: 28px; background: rgba(255,255,255,.06); border-radius: 10px; }
+.big-ico .ico { width: 40px; height: 40px; }
+.qslot .ico { width: 34px; height: 34px; }

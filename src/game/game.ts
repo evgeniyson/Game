@@ -3,6 +3,8 @@ import * as THREE from 'three';
 import { Renderer, IS_TOUCH } from '../render/renderer';
 import { World } from '../world/world';
 import { FX } from '../render/fx';
+import { GrassField } from '../render/grass';
+import { Ambient } from './ambient';
 import { Input, type Action } from '../input/input';
 import { Player } from './player';
 import { Mob } from './mob';
@@ -95,6 +97,8 @@ export interface SaveData {
 export class Game implements ItemGame, EffectCtx {
   r: Renderer;
   world: World;
+  grass: GrassField;
+  ambient: Ambient;
   fx: FX & { shake(a: number): void };
   input: Input;
   player: Player;
@@ -137,6 +141,8 @@ export class Game implements ItemGame, EffectCtx {
     const fx = new FX(r.scene);
     fx.onShake = (a) => (r.shake = Math.max(r.shake, a));
     this.fx = fx;
+    this.grass = new GrassField(r.scene, this.world);
+    this.ambient = new Ambient(r.scene, this.world);
 
     if (save) {
       const p = save.player;
@@ -669,6 +675,10 @@ export class Game implements ItemGame, EffectCtx {
       this.sfx(isMystic ? 'blink' : 'bow');
     } else {
       this.sfx('swing');
+      if (a === this.player) {
+        const glow = [0xfff4d8, 0x9aff9a, 0x8ac8ff, 0xd08aff, 0xffb050][this.player.crig.weaponRarity] ?? 0xfff4d8;
+        this.later(0.08, () => this.fx.slash(a.pos, a.facing, glow));
+      }
       this.later(0.16, () => {
         if (a.alive && t.alive && a.distTo(t) <= a.stats.attackRange + t.radius + 0.8) this.attackHit(a, t);
       });
@@ -902,6 +912,13 @@ export class Game implements ItemGame, EffectCtx {
           if (left > 0) this.spawnLoot(makeItem(d.id, left), p.pos);
           got.push(`+${q} ${ITEMS[d.id].icon}`);
           this.onGather(d.id, q);
+        }
+        if (hv.loot) {
+          const lvl = this.zoneLevel(h.pos.x, h.pos.z);
+          const n = 1 + (this.rng.chance(0.35) ? 1 : 0);
+          for (let i = 0; i < n; i++) this.spawnLoot(rollGear(randomGearId(this.rng, p.cls.id, lvl), lvl, Math.max(1, rollRarity(this.rng, 0.12)), this.rng), h.pos);
+          this.ui.log('Сундук открыт! Внутри что-то блестит…', '#ffd76a');
+          this.fx.burst(h.pos.clone().setY(h.pos.y + 0.8), 0xffd76a, 24, 3);
         }
         if (got.length) this.ui.float(h.pos.clone().setY(h.pos.y + 1.6), got.join(' '), 'loot');
         this.world.harvest(h);
@@ -1199,6 +1216,7 @@ export class Game implements ItemGame, EffectCtx {
     }
     this.visited.add(Math.floor(p.pos.x / 32) + ',' + Math.floor(p.pos.z / 32));
     const b = this.world.biomeAt(p.pos.x, p.pos.z);
+    this.r.setBiome(b);
     this.zoneName = BIOME_NAMES[b];
     this.zoneLevelNow = this.zoneLevel(p.pos.x, p.pos.z);
     this.nearStation = this.stations.find((s) => s.pos.distanceTo(p.pos) < 3.2) ?? null;
@@ -1218,11 +1236,53 @@ export class Game implements ItemGame, EffectCtx {
     }
 
     this.r.follow(p.pos, dt);
+    this.grass.update(dt, p.pos);
+    this.ambient.update(dt, p.pos, b, this.r.dayFactor < 0.35);
+    this.weather(dt, b);
     this.syncVisuals(dt);
   }
 
+  private wv = new THREE.Vector3();
+  private wp = new THREE.Vector3();
+  /** Погода частицами: снегопад, пыль, листья, пыльца */
+  private weather(dt: number, b: Biome) {
+    const c = this.r.target;
+    const rnd = (k: number) => (Math.random() - 0.5) * k;
+    if (b === Biome.Snow) {
+      for (let i = 0; i < Math.floor(dt * 70 + Math.random()); i++) {
+        this.wp.set(c.x + rnd(40), c.y + 8 + Math.random() * 8, c.z + rnd(34));
+        this.wv.set(0.7 + rnd(0.4), -1.3 - Math.random() * 0.6, 0.3 + rnd(0.4));
+        this.fx.drift(this.wp, Math.random() < 0.8 ? 0xffffff : 0xdce4ff, this.wv, 0.05 + Math.random() * 0.04, 10);
+      }
+    } else if (b === Biome.Desert) {
+      for (let i = 0; i < Math.floor(dt * 25 + Math.random()); i++) {
+        this.wp.set(c.x + rnd(36) - 8, c.y + 0.2 + Math.random() * 2.5, c.z + rnd(30));
+        this.wv.set(2.4 + Math.random(), 0.15 + rnd(0.2), 0.8 + rnd(0.5));
+        this.fx.drift(this.wp, Math.random() < 0.5 ? 0xe8c890 : 0xd8a868, this.wv, 0.035 + Math.random() * 0.03, 3.5);
+      }
+    } else if (b === Biome.Forest) {
+      if (Math.random() < dt * 6) {
+        this.wp.set(c.x + rnd(34), c.y + 5 + Math.random() * 5, c.z + rnd(28));
+        this.wv.set(0.4 + rnd(0.4), -0.7, 0.2 + rnd(0.4));
+        this.fx.drift(this.wp, [0xd88a3a, 0xc8b040, 0x7cb04a][Math.floor(Math.random() * 3)], this.wv, 0.07, 12);
+      }
+    } else if ((b === Biome.Meadow || b === Biome.Camp) && this.r.dayFactor > 0.4) {
+      if (Math.random() < dt * 8) {
+        this.wp.set(c.x + rnd(30), c.y + 0.4 + Math.random() * 2, c.z + rnd(24));
+        this.wv.set(0.3 + rnd(0.3), 0.1 + rnd(0.2), rnd(0.3));
+        this.fx.drift(this.wp, 0xfff8c0, this.wv, 0.03, 5);
+      }
+    }
+  }
+
+  private tipPos = new THREE.Vector3();
   private syncVisuals(dt: number) {
     this.player.syncRig(dt);
+    const cr = this.player.crig;
+    if (cr.weaponRarity >= 3 && this.player.alive && Math.random() < dt * 8) {
+      cr.weaponTip.getWorldPosition(this.tipPos);
+      this.fx.float(this.tipPos, cr.weaponRarity === 4 ? 0xffc060 : 0xd8a0ff, 1, 0.15, 0.05, 0.6);
+    }
     for (const m of this.mobs) m.syncRig(dt);
     this.fx.update(dt);
     this.updateAimIndicator();
@@ -1487,6 +1547,8 @@ export class Game implements ItemGame, EffectCtx {
   }
 
   dispose() {
+    this.ambient.dispose();
+    this.grass.dispose();
     this.world.dispose();
   }
 

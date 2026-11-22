@@ -1,6 +1,7 @@
 // Воксельные модели персонажей, мобов и объектов лагеря + процедурная анимация.
 import * as THREE from 'three';
-import { VoxelGrid, jit } from './voxel';
+import { VoxelGrid, jit, mixHex, vhash } from './voxel';
+import { buildGear, addRuneGems, RARITY_GLOW, WS } from './weaponModels';
 
 export const CS = 0.085; // масштаб вокселя персонажа
 
@@ -14,6 +15,9 @@ export interface AnimState {
 }
 
 export type RigKind = 'biped' | 'quad' | 'blob' | 'crab' | 'static';
+
+/** Пока true — модели мобов/станций строятся вдвое мельче со скруглёнными углами */
+let REFINE = false;
 
 export class Rig {
   group = new THREE.Group(); // позиция и поворот в мире
@@ -39,6 +43,11 @@ export class Rig {
   }
 
   mesh(g: VoxelGrid, origin: [number, number, number], scale = CS): THREE.Mesh {
+    if (REFINE) {
+      g = g.refine(2);
+      scale /= 2;
+      origin = [origin[0] * 2, origin[1] * 2, origin[2] * 2];
+    }
     const m = new THREE.Mesh(g.toGeometry(scale, origin), this.material);
     m.castShadow = true;
     m.receiveShadow = false;
@@ -144,7 +153,7 @@ export class Rig {
   }
 }
 
-// ---------------- Персонаж игрока ----------------
+// ---------------- Персонаж игрока (высокое разрешение) ----------------
 export interface Appearance {
   cls: 'warden' | 'ranger' | 'mystic';
   skin: number;
@@ -155,138 +164,371 @@ export interface Appearance {
 export const SKINS = [0xf6d5b8, 0xe8b48a, 0xc68a5e, 0x8d5a3b];
 export const HAIRS = [0x2b2b33, 0x6b4a2f, 0xd8b26a, 0xc0503a, 0xe8e8f0, 0x5a7bd8, 0x7a4ac8];
 
+export const PS = 0.056; // воксель персонажа
+
 const CLASS_COLORS = {
-  warden: { top: 0x7d8fa3, top2: 0x3d6fb5, pants: 0x40434d, shoes: 0x5a3f2b, accent: 0xd8b04a },
-  ranger: { top: 0x6b8f3a, top2: 0x8a6a40, pants: 0x5a4632, shoes: 0x3e2c1e, accent: 0xc9a46a },
-  mystic: { top: 0xf2efe6, top2: 0x4a7bd1, pants: 0x2f3d6b, shoes: 0x2a2a3a, accent: 0x5fe0ff },
+  warden: { top: 0x8a9aae, top2: 0x3d6fb5, pants: 0x3a3e4a, boots: 0x5a3f2b, accent: 0xd8b04a, cape: 0x2f5a9a },
+  ranger: { top: 0x6b8f3a, top2: 0x8a6a40, pants: 0x5a4632, boots: 0x3e2c1e, accent: 0xc9a46a, cape: 0x3f6a32 },
+  mystic: { top: 0xf2efe6, top2: 0x4a7bd1, pants: 0x2f3d6b, boots: 0x2a2a3a, accent: 0x5fe0ff, cape: 0 },
 };
 
-export function buildCharacter(ap: Appearance): Rig {
-  const rig = new Rig('biped');
+const darker = (c: number, k = 0.75) => mixHex(c, 0x000000, 1 - k);
+
+/** Персонаж со слотами под оружие/щит/головной убор, плащом и вторичной анимацией */
+export class CharacterRig extends Rig {
+  weaponSlot = new THREE.Group();
+  offhandSlot = new THREE.Group();
+  backSlot = new THREE.Group();
+  floatSlot = new THREE.Group();
+  headSlot = new THREE.Group();
+  hairBack?: THREE.Object3D;
+  cape?: THREE.Object3D;
+  lids?: THREE.Object3D;
+  defaultHead = new THREE.Group();
+  weaponTip = new THREE.Object3D();
+  private blinkT = 2;
+  private gearMats: THREE.MeshLambertMaterial[] = [];
+  weaponRarity = 0;
+  meleeWeapon = true;
+
+  constructor(public ap: Appearance) {
+    super('biped');
+  }
+
+  private gearMesh(grid: VoxelGrid, rarity: number, plus: number): THREE.Mesh {
+    const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    mat.emissive.setHex(RARITY_GLOW[Math.min(4, rarity)]);
+    if (plus >= 3) mat.emissive.lerp(new THREE.Color(0x404040), 0.5);
+    this.gearMats.push(mat);
+    const m = new THREE.Mesh(grid.toGeometry(WS), mat);
+    m.castShadow = true;
+    return m;
+  }
+
+  private clear(slot: THREE.Group) {
+    for (const c of [...slot.children]) {
+      slot.remove(c);
+      c.traverse((o) => {
+        if (o instanceof THREE.Mesh) {
+          o.geometry.dispose();
+          (o.material as THREE.Material).dispose();
+        }
+      });
+    }
+  }
+
+  setWeapon(id: string | null, rarity = 0, runes: string[] = [], plus = 0) {
+    this.clear(this.weaponSlot);
+    if (this.offhandSlot.userData.bow) {
+      this.clear(this.offhandSlot);
+      this.offhandSlot.userData.bow = false;
+    }
+    this.weaponRarity = rarity;
+    this.meleeWeapon = this.ap.cls === 'warden';
+    if (!id) return;
+    const gm = buildGear(id);
+    if (!gm) return;
+    addRuneGems(gm.grid, runes);
+    const m = this.gearMesh(gm.grid, rarity, plus);
+    if (gm.mount === 'bow') {
+      // лук держим в левой руке
+      this.clear(this.offhandSlot);
+      m.rotation.y = Math.PI / 2;
+      this.offhandSlot.add(m);
+      this.offhandSlot.userData.bow = true;
+      this.weaponTip.position.set(0, 0.6, 0);
+      return;
+    }
+    m.rotation.x = id.includes('Staff') ? 0.08 : Math.PI / 2;
+    this.weaponSlot.add(m);
+    m.add(this.weaponTip);
+    this.weaponTip.position.set(0, 20 * WS, 0);
+  }
+
+  setOffhand(id: string | null, rarity = 0) {
+    if (this.offhandSlot.userData.bow) {
+      // лук занимает левую руку — второй предмет вешаем на спину/рядом
+    } else this.clear(this.offhandSlot);
+    this.clear(this.backSlot);
+    this.clear(this.floatSlot);
+    if (!id) return;
+    const gm = buildGear(id);
+    if (!gm) return;
+    const m = this.gearMesh(gm.grid, rarity, 0);
+    if (gm.mount === 'arm') {
+      if (this.offhandSlot.userData.bow) return;
+      m.rotation.y = -Math.PI / 2;
+      this.offhandSlot.add(m);
+    } else if (gm.mount === 'back') {
+      m.rotation.z = 0.5;
+      this.backSlot.add(m);
+    } else if (gm.mount === 'float') this.floatSlot.add(m);
+  }
+
+  setHeadgear(id: string | null) {
+    this.clear(this.headSlot);
+    this.defaultHead.visible = !id;
+    if (!id) return;
+    const g = headgearGrid(id, this.ap);
+    if (!g) {
+      this.defaultHead.visible = true;
+      return;
+    }
+    this.headSlot.add(this.mesh(g, [6.5, 0, 6], PS));
+  }
+
+  animate(dt: number, st: AnimState) {
+    super.animate(dt, st);
+    if (st.dead >= 0) return;
+    const t = performance.now() / 1000;
+    // дыхание
+    if (this.torso) this.torso.scale.y = 1 + Math.sin(t * 2.2) * 0.012;
+    // волосы и плащ
+    const mv = st.moving ? 1 : 0;
+    if (this.hairBack) this.hairBack.rotation.x = -0.12 * mv - Math.sin(t * 2 + 1) * 0.03 - Math.abs(Math.sin(t * 9)) * 0.05 * mv;
+    if (this.cape) this.cape.rotation.x = -0.35 * mv - 0.05 - Math.sin(t * 7) * 0.06 * mv - Math.sin(t * 1.6) * 0.03;
+    // моргание
+    this.blinkT -= dt;
+    if (this.lids) this.lids.visible = this.blinkT < 0.12;
+    if (this.blinkT < 0) this.blinkT = 2.5 + Math.random() * 3;
+    // парящая руна
+    this.floatSlot.position.set(-0.55 + Math.cos(t * 1.5) * 0.1, 1.2 + Math.sin(t * 2) * 0.08, 0.25 + Math.sin(t * 1.5) * 0.1);
+    this.floatSlot.rotation.y = t;
+  }
+}
+
+/** Коробчатая «оболочка» вокруг головы с волосами: x -2..14, z -2..13 */
+function shell(g: VoxelGrid, y0: number, y1: number, col: (x: number, y: number, z: number) => number | null, back = -2) {
+  for (let x = -2; x <= 14; x++)
+    for (let z = back; z <= 13; z++)
+      for (let y = y0; y <= y1; y++) {
+        const edgeX = x === -2 || x === 14,
+          edgeZ = z === back || z === 13,
+          top = y === y1;
+        if (!(edgeX || edgeZ || top)) continue;
+        if (top && (edgeX || edgeZ)) continue; // скруглённая кромка сверху
+        const c = col(x, y, z);
+        if (c !== null) g.set(x, y, z, c);
+      }
+}
+
+function headgearGrid(id: string, ap: Appearance): VoxelGrid | null {
+  const g = new VoxelGrid();
+  switch (id) {
+    case 'warden':
+    case 'steelHelm': {
+      const base = id === 'warden' ? 0xa8b4c2 : 0x8a949e;
+      shell(g, 5, 15, (x, y, z) => {
+        if (z === 13 && y < 10 && x >= 1 && x <= 11) return null; // открытое лицо
+        if (y === 10 || y === 11) return jit(darker(base, 0.78), x, y, z, 0.04);
+        return jit(base, x, y, z, 0.04);
+      });
+      g.box(-1, 15, -1, 15, 1, 14, (x, y, z) => jit(base, x, y, z, 0.04)); // купол
+      g.box(1, 16, 1, 11, 1, 10, (x, y, z) => jit(darker(base, 1.08), x, y, z, 0.04));
+      g.box(-2, 9, 13, 3, 1, 1, darker(base, 0.6)).box(12, 9, 13, 3, 1, 1, darker(base, 0.6));
+      if (id === 'warden') for (let z = -3; z <= 11; z++) g.box(5, 17 + Math.round(Math.sin(((z + 3) / 14) * Math.PI) * 2), z, 3, 2, 1, jit(0xc0392b, 5, 17, z, 0.08));
+      return g;
+    }
+    case 'ranger':
+    case 'leatherHood': {
+      const base = id === 'ranger' ? 0x4f7f3a : 0x8a5a34;
+      shell(g, 0, 15, (x, y, z) => (z === 13 && y < 12 && x >= 0 && x <= 12 ? null : jit(base, x, y, z, 0.06)), -3);
+      g.box(-1, 15, -2, 15, 1, 15, (x, y, z) => jit(base, x, y, z, 0.06));
+      g.box(4, 12, -5, 5, 3, 2, base).box(5, 10, -6, 3, 3, 1, base); // кончик капюшона
+      g.box(-2, 12, 14, 17, 1, 1, darker(base, 0.8)); // кромка
+      return g;
+    }
+    case 'mystic': {
+      for (let x = -6; x <= 18; x++)
+        for (let z = -6; z <= 18; z++) {
+          const d = Math.hypot(x - 6, z - 5.5);
+          if (d > 12.4) continue;
+          const droop = d > 10 ? 1 : 0;
+          g.set(x, 14 - droop, z, jit(d > 11.4 ? 0xe2ded2 : 0xf2efe6, x, 14, z, 0.03));
+        }
+      for (let y = 15; y < 30; y++) {
+        const r = Math.max(0.6, 7.2 - (y - 15) * 0.45);
+        const bend = y > 24 ? (y - 24) * 0.9 : 0;
+        for (let x = -8; x <= 20; x++)
+          for (let z = -8; z <= 20; z++) {
+            if ((x - 6) ** 2 + (z - 5.5 + bend) ** 2 > r * r) continue;
+            g.set(x, y, z, y === 15 || y === 16 ? 0x4a7bd1 : jit(0xf2efe6, x, y, z, 0.03));
+          }
+      }
+      g.set(10, 16, 12, 0xffe080).set(11, 17, 12, 0xffe080).set(9, 17, 12, 0xffe080).set(10, 18, 12, 0xffe080);
+      return g;
+    }
+    case 'sageCirclet': {
+      shell(g, 9, 9, (x) => (x % 3 === 0 ? 0xf0d070 : 0xd8b04a));
+      g.box(5, 9, 14, 3, 2, 1, 0x5fe0ff);
+      return g;
+    }
+    case 'berserkerMask': {
+      g.box(-1, 2, 13, 15, 8, 1, (x, y) => ((y === 4 || y === 5) && (x === 3 || x === 4 || x === 8 || x === 9) ? 0x111111 : jit(0xb02a2a, x, y, 13, 0.06)));
+      g.line([0, 9, 13], [-3, 15, 12], 0.5, 0xf2e8d0).line([12, 9, 13], [15, 15, 12], 0.5, 0xf2e8d0);
+      return g;
+    }
+  }
+  void ap;
+  return null;
+}
+
+export function buildCharacter(ap: Appearance): CharacterRig {
+  const rig = new CharacterRig(ap);
   const c = CLASS_COLORS[ap.cls];
+  const S = PS;
   const skin = ap.skin;
   const hair = ap.hair;
 
-  // Ноги (пивот у бедра)
+  // ---- Ноги (пивот у бедра): 4×10×4, ботинки с подошвой и носком
   const leg = (side: number) => {
     const g = new VoxelGrid();
-    g.box(0, 0, 0, 2, 6, 3, (x, y) => (y <= 1 ? c.shoes : y <= 3 ? (ap.cls === 'warden' ? c.pants : skin) : c.pants));
-    if (ap.cls === 'warden') g.box(0, 2, 2, 2, 2, 1, 0x9aa7b5);
-    return rig.part(g, [1, 6, 1.5], [side * 1.05 * CS, 6 * CS, 0]);
+    g.box(0, 0, 0, 4, 10, 4, (x, y, z) => {
+      if (y === 0) return darker(c.boots, 0.6);
+      if (y <= 2) return jit(c.boots, x, y, z, 0.05);
+      if (y === 3) return ap.cls === 'warden' ? 0xa8b4c2 : darker(c.boots, 1.15);
+      if (y <= 5) return ap.cls === 'warden' ? jit(0x9aa7b5, x, y, z, 0.04) : ap.cls === 'mystic' ? c.pants : jit(0xf2efe6, x, y, z, 0.03);
+      return jit(c.pants, x, y, z, 0.05);
+    });
+    g.box(0, 0, 4, 4, 2, 1, c.boots).box(0, 0, 4, 4, 1, 1, darker(c.boots, 0.6)); // носок
+    if (ap.cls === 'warden') g.box(0, 5, 4, 4, 2, 1, 0xa8b4c2); // наколенник
+    return rig.part(g, [2, 10, 2], [side * 2 * S, 10 * S, 0], rig.root, S);
   };
   rig.legs.push(leg(-1), leg(1));
 
-  // Торс
+  // ---- Торс 10×9×6
   const torso = new THREE.Group();
-  torso.position.set(0, 6 * CS, 0);
+  torso.position.set(0, 10 * S, 0);
   rig.root.add(torso);
   rig.torso = torso;
   const tg = new VoxelGrid();
-  tg.box(0, 0, 0, 6, 6, 4, (x, y, z) => {
-    if (y === 0) return ap.cls === 'mystic' ? c.top2 : 0x5a3f2b; // пояс
-    if (ap.cls === 'warden') return z === 3 && x >= 2 && x <= 3 ? c.top2 : jit(c.top, x, y, z, 0.05);
-    if (ap.cls === 'ranger') return x === 2 && z === 3 ? c.top2 : jit(c.top, x, y, z, 0.05);
-    return z === 3 && (x === 2 || x === 3) ? c.top2 : c.top;
+  tg.box(0, 0, 0, 10, 9, 6, (x, y, z) => {
+    const front = z === 5;
+    if (y <= 1) return y === 1 && front && (x === 4 || x === 5) ? c.accent : jit(0x4a3020, x, y, z, 0.05); // ремень с пряжкой
+    if (ap.cls === 'warden') {
+      if (front && (x === 4 || x === 5)) return jit(c.top2, x, y, z, 0.04);
+      if (front && y === 6 && (x === 1 || x === 8)) return 0xe0e4e8; // заклёпки
+      return jit(y >= 7 ? 0xa8b4c2 : c.top, x, y, z, 0.04);
+    }
+    if (ap.cls === 'ranger') {
+      if (front && x + 1 === y) return jit(0x6a4a2a, x, y, z, 0.05); // перевязь
+      if (front && y === 8 && x >= 3 && x <= 6) return 0xf2efe6; // воротник рубашки
+      return jit(c.top, x, y, z, 0.05);
+    }
+    if (front && (x === 4 || x === 5)) return c.top2;
+    if (front && y === 8) return c.top2;
+    return jit(c.top, x, y, z, 0.03);
   });
-  if (ap.cls === 'mystic') tg.box(-1, -2, -1, 8, 3, 6, (x, y, z) => (y === -2 ? c.top2 : c.top)); // мантия
-  if (ap.cls === 'warden') {
-    tg.box(-1, 5, -1, 2, 2, 6, 0x9aa7b5);
-    tg.box(5, 5, -1, 2, 2, 6, 0x9aa7b5);
+  if (ap.cls === 'ranger') tg.box(-1, 2, 1, 1, 3, 3, 0x6a4a2a).set(-1, 3, 4, c.accent); // подсумок
+  if (ap.cls === 'mystic') {
+    // подол мантии
+    for (let y = -6; y < 0; y++) {
+      const grow = Math.floor(-y / 3);
+      tg.box(-grow, y, -grow, 10 + grow * 2, 1, 6 + grow * 2, (x, yy, z) => (yy === -6 ? c.top2 : (z === 5 + grow && (x === 4 || x === 5)) ? c.top2 : jit(c.top, x, yy, z, 0.03)));
+    }
   }
-  if (ap.cls === 'ranger') tg.box(1, 1, -2, 2, 7, 1, 0x7a5434); // колчан
-  torso.add(rig.mesh(tg, [3, 0, 2]));
+  torso.add(rig.mesh(tg, [5, 0, 3], S));
 
-  // Руки (пивот у плеча)
+  // ---- Плащ
+  if (c.cape) {
+    const cg = new VoxelGrid();
+    for (let x = -5; x < 5; x++) {
+      const len = 15 + Math.round(vhash(x, 0, 0, 3) * 2);
+      for (let y = -len; y <= 0; y++) cg.set(x, y, 0, jit(y > -2 ? darker(c.cape, 0.8) : c.cape, x, y, 0, 0.05));
+    }
+    const cape = rig.part(cg, [-0.5, 0, 0], [0, 8.5 * S, -3.6 * S], torso, S);
+    rig.cape = cape;
+  }
+
+  // ---- Руки (пивот у плеча) 3×9×3
   const arm = (side: number) => {
     const g = new VoxelGrid();
-    g.box(0, 0, 0, 2, 6, 2, (x, y) => (y <= 1 ? skin : ap.cls === 'warden' && y >= 4 ? 0x9aa7b5 : c.top));
-    return rig.part(g, [1, 6, 1], [side * 4 * CS, 6 * CS, 0], torso);
+    g.box(0, 0, 0, 3, 9, 3, (x, y, z) => {
+      if (y <= 1) return ap.cls === 'mystic' ? skin : y === 0 ? darker(c.boots, 0.9) : jit(0x6a4a2a, x, y, z, 0.05); // кисть/перчатка
+      if (y === 2) return ap.cls === 'mystic' ? c.top2 : skin;
+      return jit(ap.cls === 'warden' && y >= 6 ? 0xa8b4c2 : c.top, x, y, z, 0.04);
+    });
+    if (ap.cls === 'warden') g.box(-1, 6, -1, 5, 3, 5, (x, y, z) => jit(y === 8 ? 0xc0c8d2 : 0x9aa7b5, x, y, z, 0.04)); // наплечник
+    if (ap.cls === 'mystic') g.box(-1, 2, -1, 5, 2, 5, (x, y, z) => jit(c.top, x, y, z, 0.03)); // широкий рукав
+    return rig.part(g, [1.5, 9, 1.5], [side * 6.5 * S, 8.6 * S, 0], torso, S);
   };
   rig.armL = arm(-1);
   rig.armR = arm(1);
+  rig.weaponSlot.position.set(0, -8.4 * S, 0.6 * S);
+  rig.armR.add(rig.weaponSlot);
+  rig.offhandSlot.position.set(-0.4 * S, -6.5 * S, 0.8 * S);
+  rig.armL.add(rig.offhandSlot);
+  rig.backSlot.position.set(2 * S, 2 * S, -4 * S);
+  torso.add(rig.backSlot);
+  rig.group.add(rig.floatSlot);
 
-  // Оружие в правой руке
-  const wg = new VoxelGrid();
-  if (ap.cls === 'warden') {
-    wg.box(0, -1, 0, 1, 2, 1, 0x6b4a2f);
-    wg.box(-1, 1, 0, 3, 1, 1, c.accent);
-    wg.box(0, 2, 0, 1, 9, 1, (x, y) => (y === 10 ? 0xffffff : 0xd0d6dc));
-    const w = rig.part(wg, [0.5, 0, 0.5], [0, -6 * CS, 0.5 * CS], rig.armR);
-    w.rotation.x = Math.PI / 2;
-    // щит в левой
-    const sg = new VoxelGrid();
-    for (let x = -3; x <= 3; x++)
-      for (let y = -3; y <= 3; y++) {
-        if (Math.abs(x) + Math.abs(y) > 4) continue;
-        sg.set(x, y, 0, y === 0 && Math.abs(x) < 3 ? 0xffffff : 0xc0392b);
-      }
-    sg.box(0, -6, 1, 1, 3, 1, 0x888888);
-    const sh = rig.part(sg, [0, 0, 0], [-1.3 * CS, -4 * CS, 1.5 * CS], rig.armL);
-    sh.rotation.y = -Math.PI / 2;
-  } else if (ap.cls === 'ranger') {
-    for (let y = -6; y <= 6; y++) {
-      const z = Math.round(Math.cos((y / 6) * 1.2) * 2);
-      wg.set(0, y, z, 0x8a5a30);
-    }
-    for (let y = -5; y <= 5; y++) wg.set(0, y, -1, 0xeeeeee);
-    const w = rig.part(wg, [0.5, 0, 0.5], [0, -5 * CS, 0.5 * CS], rig.armL);
-    w.rotation.y = Math.PI / 2;
-  } else {
-    wg.box(0, -4, 0, 1, 16, 1, 0x7a5434);
-    wg.box(-1, 12, -1, 3, 3, 3, (x, y) => (y === 13 ? 0xb8f4ff : c.accent));
-    const w = rig.part(wg, [0.5, 0, 0.5], [0, -6 * CS, 0.5 * CS], rig.armR);
-    w.rotation.x = 0.1;
-  }
-
-  // Голова — крупная, чиби
+  // ---- Голова 13×12×12 (чиби), лицо на z=11
   const hg = new VoxelGrid();
-  hg.box(0, 0, 0, 8, 8, 8, skin);
-  // волосы
-  hg.box(-1, 5, -1, 10, 4, 10, (x, y, z) => (z === 8 && y < 7 && x > 0 && x < 7 ? null : hair));
-  hg.box(-1, 1, -1, 10, 4, 3, hair);
-  hg.box(-1, 3, -1, 1, 3, 9, hair);
-  hg.box(8, 3, -1, 1, 3, 9, hair);
-  hg.box(0, 6, 8, 3, 2, 1, hair);
-  if (ap.longHair) hg.box(0, -4, -1, 8, 6, 2, hair), hg.box(-1, -2, 0, 1, 4, 4, hair), hg.box(8, -2, 0, 1, 4, 4, hair);
-  // лицо
-  hg.set(2, 3, 8, 0x3a2418);
-  hg.set(2, 4, 8, 0x5a3a28);
-  hg.set(5, 3, 8, 0x3a2418);
-  hg.set(5, 4, 8, 0x5a3a28);
-  hg.set(1, 2, 8, 0xf2a0a0);
-  hg.set(6, 2, 8, 0xf2a0a0);
-  hg.set(3, 1, 8, 0xc07060);
-  hg.set(4, 1, 8, 0xc07060);
-  // головные уборы
-  if (ap.cls === 'warden') {
-    hg.box(-1, 6, -1, 10, 3, 10, (x, y, z) => (z === 8 && y === 6 && x > 0 && x < 7 ? null : jit(0x9aa7b5, x, y, z, 0.04)));
-    hg.box(3, 9, -1, 2, 2, 9, 0xc0392b);
-  } else if (ap.cls === 'ranger') {
-    hg.box(-1, 2, -2, 10, 8, 11, (x, y, z) => {
-      if (z >= 7 && y < 8 && x >= 0 && x <= 7) return null;
-      if (z === 8 && y === 8) return 0x5a7a30;
-      return jit(0x4f8a3c, x, y, z, 0.05);
-    });
-    hg.box(2, 6, -3, 4, 3, 2, 0x4f8a3c);
-  } else {
-    hg.box(-4, 8, -4, 16, 1, 16, (x, y, z) => (Math.hypot(x - 3.5, z - 3.5) <= 7.8 ? jit(0xf2efe6, x, y, z, 0.03) : null));
-    hg.box(0, 9, 0, 8, 1, 8, 0x4a7bd1);
-    hg.box(1, 10, 1, 6, 3, 6, 0xf2efe6);
-    hg.box(2, 13, 2, 4, 2, 4, 0xf2efe6);
-    hg.box(3, 15, 3, 2, 2, 2, 0xf2efe6);
-    hg.set(4, 17, 3, 0xf2efe6);
+  hg.box(0, 0, 0, 13, 12, 12, (x, y, z) => jit(skin, x, y, z, 0.02));
+  const FZ = 12; // слой лица перед кожей
+  const eyeCol = 0x6a3a2a;
+  for (const ex of [3, 8]) {
+    hg.box(ex - 1, 6, FZ - 1, 4, 1, 1, 0x2a1a14); // ресницы
+    hg.box(ex, 4, FZ - 1, 2, 2, 1, eyeCol);
+    hg.set(ex, 5, FZ - 1, 0xffffff); // блик
+    hg.set(ex + 1, 4, FZ - 1, darker(eyeCol, 0.6));
+    hg.box(ex, 8, FZ - 1, 2, 1, 1, darker(hair, 0.8)); // брови
+    hg.set(ex === 3 ? 2 : 10, 3, FZ - 1, 0xf2a0a0); // румянец
   }
+  hg.set(6, 2, FZ - 1, 0xc07060).set(7, 2, FZ - 1, 0xb06050); // рот
+  hg.set(6, 3, FZ - 1, darker(skin, 0.92));
+  // волосы: шапка, чёлка с прядями, виски, затылок
+  for (let x = -1; x <= 13; x++)
+    for (let z = -1; z <= 12; z++) {
+      for (let y = 9; y <= 12; y++) if (!(z === 12 && y < 9)) hg.set(x, y, z, jit(hair, x, y, z, 0.06));
+      hg.set(x, 13, z, jit(darker(hair, 1.1), x, 13, z, 0.06));
+    }
+  for (let x = 0; x <= 12; x++) {
+    const len = 2 + Math.floor(vhash(x, 1, 1, 7) * 3) + (x === 0 || x === 12 ? 3 : 0);
+    for (let y = 12 - len; y <= 11; y++) hg.set(x, y, FZ, jit(hair, x, y, FZ, 0.06));
+  }
+  for (const sx of [-1, 13]) for (let y = 2; y <= 11; y++) for (let z = 5; z <= 12; z++) if (y > 4 || z < 10) hg.set(sx, y, z, jit(hair, sx, y, z, 0.06));
+  for (let x = -1; x <= 13; x++) for (let y = 2; y <= 12; y++) hg.set(x, y, -1, jit(hair, x, y, -1, 0.06));
   const head = new THREE.Group();
-  head.position.set(0, 6 * CS, 0);
-  head.add(rig.mesh(hg, [4, 0, 4]));
+  head.position.set(0, 9 * S, 0);
+  head.add(rig.mesh(hg, [6.5, 0, 6], S));
   torso.add(head);
   rig.head = head;
-  rig.height = 22 * CS;
+  // веки для моргания
+  const lg = new VoxelGrid();
+  for (const ex of [3, 8]) lg.box(ex, 4, FZ, 2, 2, 1, darker(skin, 0.9));
+  const lids = rig.part(lg, [6.5, 0, 6], [0, 0, 0], head, S);
+  lids.visible = false;
+  rig.lids = lids;
+  // длинные волосы — отдельная часть с покачиванием
+  if (ap.longHair) {
+    const bg = new VoxelGrid();
+    for (let x = 0; x <= 12; x++) {
+      const len = 13 + Math.round(vhash(x, 2, 2, 9) * 3) - (x === 0 || x === 12 ? 3 : 0);
+      for (let y = -len; y <= 0; y++) bg.set(x, y, 0, jit(y < -len + 2 ? darker(hair, 0.85) : hair, x, y, 0, 0.06)).set(x, y, -1, jit(hair, x, y, -1, 0.06));
+    }
+    rig.hairBack = rig.part(bg, [6.5, 0, 0], [0, 9 * S, -8 * S], head, S);
+  }
+  // головной убор класса (заменяется предметом головы)
+  head.add(rig.defaultHead);
+  head.add(rig.headSlot);
+  const dh = headgearGrid(ap.cls, ap);
+  if (dh) rig.defaultHead.add(rig.mesh(dh, [6.5, 0, 6], S));
+  rig.height = 31 * S;
   return rig;
 }
 
 // ---------------- Мобы ----------------
 export function buildMob(model: string): Rig {
+  REFINE = true;
+  try {
+    return buildMobInner(model);
+  } finally {
+    REFINE = false;
+  }
+}
+
+function buildMobInner(model: string): Rig {
   switch (model) {
     case 'crab':
       return crab();
@@ -302,6 +544,12 @@ export function buildMob(model: string): Rig {
       return quad({ body: 0xc08a50, belly: 0xeedcc0, accent: 0xffffff, len: 9, h: 5, legH: 7, antlers: true, tail: true });
     case 'rabbit':
       return quad({ body: 0xe8dcc8, belly: 0xffffff, accent: 0xf0a0a0, len: 5, h: 4, legH: 2, ears: true, horn: true });
+    case 'fox':
+      return quad({ body: 0xd8642a, belly: 0xf2efe6, accent: 0xe87a3a, len: 8, h: 4, legH: 3, snout: true, ears: true, tail: true });
+    case 'camel':
+      return quad({ body: 0xc89a5a, belly: 0xe0c08a, accent: 0xb8864a, len: 12, h: 6, legH: 10, snout: true, tail: true, hump: true });
+    case 'lizard':
+      return quad({ body: 0x8a9a4a, belly: 0xc8c890, accent: 0x6a8a3a, len: 6, h: 2, legH: 1, tail: true });
     case 'toad':
       return toad();
     case 'automaton':
@@ -373,6 +621,7 @@ interface QuadOpts {
   tusks?: boolean;
   antlers?: boolean;
   horn?: boolean;
+  hump?: boolean;
 }
 function quad(o: QuadOpts): Rig {
   const rig = new Rig('quad');
@@ -383,6 +632,7 @@ function quad(o: QuadOpts): Rig {
     if (y === o.h - 1 && (x + z) % 3 === 0) return o.accent;
     return jit(o.body, x, y, z, 0.06);
   });
+  if (o.hump) bg.sphere(0, o.h + 1, -1, 2.5, 2.5, 3, (x, y, z) => jit(o.body, x, y, z, 0.06));
   const body = rig.part(bg, [0, 0, 0], [0, o.legH * CS, 0]);
   rig.torso = body;
   // голова
@@ -519,6 +769,15 @@ function ogre(): Rig {
 
 // ---------------- Объекты лагеря ----------------
 export function buildStation(kind: string): THREE.Group {
+  REFINE = true;
+  try {
+    return buildStationInner(kind);
+  } finally {
+    REFINE = false;
+  }
+}
+
+function buildStationInner(kind: string): THREE.Group {
   const rig = new Rig('static');
   const S = 0.125;
   const g = new VoxelGrid();

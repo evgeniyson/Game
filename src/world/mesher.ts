@@ -74,7 +74,17 @@ export function meshChunk(blocks: Uint8Array, cx: number, cz: number): { opaque:
               wa.nor.push(F.n[0] * 127, F.n[1] * 127, F.n[2] * 127);
               const c = BLOCK_COLORS[B.Water];
               const k = f === 2 ? 1 : 0.85;
-              wa.col.push(LIN[(c[0] * k) | 0], LIN[(c[1] * k) | 0], LIN[(c[2] * k) | 0]);
+              // пена у берега: вершина касается твёрдого блока на уровне воды
+              let foam = 0;
+              if (f === 2) {
+                const vx = x + v[0],
+                  vz = z + v[2];
+                for (let ddx = -1; ddx <= 0; ddx++) for (let ddz = -1; ddz <= 0; ddz++) if (solid(vx + ddx, y, vz + ddz) || solid(vx + ddx, y + 1, vz + ddz)) foam = 1;
+              }
+              const r = c[0] * k + (235 - c[0] * k) * foam * 0.6,
+                g = c[1] * k + (245 - c[1] * k) * foam * 0.6,
+                bb = c[2] * k + (250 - c[2] * k) * foam * 0.6;
+              wa.col.push(LIN[r | 0], LIN[g | 0], LIN[bb | 0]);
             }
             wa.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
             wa.vc += 4;
@@ -122,6 +132,26 @@ export function meshChunk(blocks: Uint8Array, cx: number, cz: number): { opaque:
             }
             ao.push(s1 && s2 ? 0 : 3 - (s1 + s2 + cc));
           }
+          // Боковые грани травы/снега/мха: неровная «бахрома» верхнего слоя из микро-вокселей
+          const capCol = f !== 2 && f !== 3 && !solid(x, y + 1, z) ? CAP[b] : undefined;
+          if (capCol) {
+            const aom = ao.map((a) => AO_CURVE[a] * jitter);
+            const lips: number[] = [];
+            for (let i = 0; i < 8; i++) lips.push((1 + Math.floor(hash3((x + ox) * 8 + i, y, (z + oz) * 8 + f, 77) * 3)) / 8);
+            const maxLip = Math.max(...lips);
+            subQuad(op, x, y, z, F, 0, 1, 0, 1 - maxLip, capCol[1], aom);
+            let i0 = 0;
+            while (i0 < 8) {
+              let i1 = i0 + 1;
+              while (i1 < 8 && lips[i1] === lips[i0]) i1++;
+              const u0 = i0 / 8,
+                u1 = i1 / 8;
+              subQuad(op, x, y, z, F, u0, u1, 1 - lips[i0], 1, capCol[0], aom);
+              if (lips[i0] < maxLip) subQuad(op, x, y, z, F, u0, u1, 1 - maxLip, 1 - lips[i0], capCol[1], aom);
+              i0 = i1;
+            }
+            continue;
+          }
           const base = op.vc;
           for (let k = 0; k < 4; k++) {
             const v = F.v[k];
@@ -139,5 +169,45 @@ export function meshChunk(blocks: Uint8Array, cx: number, cz: number): { opaque:
 }
 
 const mix = (a: [number, number, number], b: [number, number, number], t: number): [number, number, number] => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const shade = (a: [number, number, number], k: number): [number, number, number] => [a[0] * k, a[1] * k, a[2] * k];
+
+/** [цвет верхнего слоя, цвет под ним] для боковых граней */
+const CAP: Partial<Record<number, [[number, number, number], [number, number, number]]>> = {
+  [B.Grass]: [shade(BLOCK_COLORS[B.Grass], 0.92), BLOCK_COLORS[B.Dirt]],
+  [B.DarkGrass]: [shade(BLOCK_COLORS[B.DarkGrass], 0.92), BLOCK_COLORS[B.Dirt]],
+  [B.Snow]: [shade(BLOCK_COLORS[B.Snow], 0.95), BLOCK_COLORS[B.Stone]],
+  [B.Moss]: [shade(BLOCK_COLORS[B.Moss], 0.9), BLOCK_COLORS[B.Mud]],
+};
+
+/** Часть боковой грани: u — по горизонтали, v — по вертикали (0..1). AO интерполируется билинейно. */
+function subQuad(op: Builder, x: number, y: number, z: number, F: (typeof FACES)[number], u0: number, u1: number, v0: number, v1: number, c: [number, number, number], aom: number[]) {
+  const horiz = F.n[0] !== 0 ? 2 : 0; // ось вдоль грани
+  const base = op.vc;
+  // билинейная интерполяция AO по углам грани
+  const aoAt = (hu: number, vv: number) => {
+    let acc = 0,
+      wsum = 0;
+    for (let k = 0; k < 4; k++) {
+      const v = F.v[k];
+      const w = (v[horiz] ? hu : 1 - hu) * (v[1] ? vv : 1 - vv);
+      acc += aom[k] * w;
+      wsum += w;
+    }
+    return acc / Math.max(1e-6, wsum);
+  };
+  for (let k = 0; k < 4; k++) {
+    const v = F.v[k];
+    const hu = v[horiz] ? u1 : u0;
+    const vv = v[1] ? v1 : v0;
+    const px = horiz === 0 ? hu : v[0];
+    const pz = horiz === 2 ? hu : v[2];
+    op.pos.push(x + px, y + vv, z + pz);
+    op.nor.push(F.n[0] * 127, F.n[1] * 127, F.n[2] * 127);
+    const m = aoAt(hu, vv);
+    op.col.push(LIN[Math.min(255, (c[0] * m) | 0)], LIN[Math.min(255, (c[1] * m) | 0)], LIN[Math.min(255, (c[2] * m) | 0)]);
+  }
+  op.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  op.vc += 4;
+}
 const mixGrassSide = mix(BLOCK_COLORS[B.Grass], BLOCK_COLORS[B.Dirt], 0.35);
 const mixDarkGrassSide = mix(BLOCK_COLORS[B.DarkGrass], BLOCK_COLORS[B.Dirt], 0.35);

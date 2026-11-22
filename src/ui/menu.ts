@@ -44,6 +44,7 @@ export class Menu {
     const c = this.r.camera;
     c.position.set(Math.sin(this.angle) * R, GROUND + 22, Math.cos(this.angle) * R);
     c.lookAt(0, GROUND + 2, 0);
+    this.r.focus.set(0, GROUND + 2, 0);
     this.r.sun.position.set(-18, GROUND + 40, 14);
     this.r.sun.target.position.set(0, GROUND, 0);
     if (this.prev) {
@@ -175,7 +176,11 @@ export class Menu {
     }
     const pv = this.prev;
     if (pv.rig) pv.scene.remove(pv.rig.group);
-    pv.rig = buildCharacter(this.ap);
+    const cr = buildCharacter(this.ap);
+    const start = CLASSES[this.ap.cls].startItems;
+    cr.setWeapon(start[0], 1);
+    cr.setOffhand(start[1], 0);
+    pv.rig = cr;
     pv.rig.group.scale.setScalar(1.15);
     pv.scene.add(pv.rig.group);
     box.append(pv.r.domElement);

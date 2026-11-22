@@ -11,6 +11,7 @@ import { ITEMS } from '../data/items';
 import { BLOCK_COLORS } from '../world/blocks';
 import { questTitle } from '../game/quests';
 import { Panels } from './panels';
+import { iconNode } from '../render/icons';
 import { Mob } from '../game/mob';
 import { CAMP_RADIUS } from '../world/gen';
 
@@ -322,7 +323,7 @@ export class Hud implements UIHooks {
       if (b.dataset.k !== key) {
         b.dataset.k = key;
         clear(b);
-        b.append(el("s", {}, String(i + 1)), def ? def.icon : "＋");
+        b.append(el("s", {}, String(i + 1)), def && f ? iconNode(def.id, def.icon, f.item.rarity) : "＋");
         if (cnt) b.append(el("b", {}, String(cnt)));
         if (cd > 0) b.append(el("div", { class: "cd" }));
         b.style.opacity = def ? '1' : '0.6';
